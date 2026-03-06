@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/sirupsen/logrus"
-	"github.com/xpzouying/headless_browser"
 	"github.com/xpzouying/xiaohongshu-mcp/browser"
 	"github.com/xpzouying/xiaohongshu-mcp/configs"
 	"github.com/xpzouying/xiaohongshu-mcp/cookies"
@@ -19,7 +19,20 @@ import (
 )
 
 // XiaohongshuService 小红书业务服务
-type XiaohongshuService struct{}
+type XiaohongshuService struct {
+	// 浏览器登录会话管理
+	loginSessionMu sync.Mutex
+	loginSession   *BrowserLoginSession
+}
+
+// BrowserLoginSession 浏览器登录会话
+type BrowserLoginSession struct {
+	Browser    *browser.Browser
+	Page       *rod.Page
+	CreatedAt  time.Time
+	IsLoggedIn bool
+	Username   string
+}
 
 // NewXiaohongshuService 创建小红书服务实例
 func NewXiaohongshuService() *XiaohongshuService {
@@ -545,7 +558,7 @@ func (s *XiaohongshuService) ReplyCommentToFeed(ctx context.Context, feedID, xse
 	}, nil
 }
 
-func newBrowser() *headless_browser.Browser {
+func newBrowser() *browser.Browser {
 	return browser.NewBrowser(configs.IsHeadless(), browser.WithBinPath(configs.GetBinPath()))
 }
 
@@ -598,3 +611,164 @@ func (s *XiaohongshuService) GetMyProfile(ctx context.Context) (*UserProfileResp
 
 	return response, nil
 }
+
+// TriggerBrowserLogin 启动浏览器登录会话
+func (s *XiaohongshuService) TriggerBrowserLogin(ctx context.Context) (*LoginStatusResponse, error) {
+	s.loginSessionMu.Lock()
+	defer s.loginSessionMu.Unlock()
+
+	// 如果已有活跃会话，先关闭
+	if s.loginSession != nil && s.loginSession.Browser != nil {
+		if s.loginSession.Page != nil {
+			_ = s.loginSession.Page.Close()
+		}
+		s.loginSession.Browser.Close()
+	}
+
+	// 创建新的非 headless 浏览器（显示浏览器窗口）
+	b := browser.NewBrowser(false, browser.WithBinPath(configs.GetBinPath()))
+	page := b.NewPage()
+
+	// 使用 background context，避免请求超时导致 context 取消
+	bgCtx := context.Background()
+
+	// 导航到小红书首页，触发二维码弹窗
+	pp := page.Context(bgCtx)
+	if err := pp.Navigate("https://www.xiaohongshu.com/explore"); err != nil {
+		logrus.Errorf("failed to navigate: %v", err)
+		_ = page.Close()
+		b.Close()
+		return nil, fmt.Errorf("导航到小红书失败: %v", err)
+	}
+
+	// 等待页面加载
+	if err := pp.WaitLoad(); err != nil {
+		logrus.Errorf("failed to wait load: %v", err)
+	}
+	time.Sleep(2 * time.Second)
+
+	// 检查是否已经登录
+	exists, _, _ := pp.Has(".main-container .user .link-wrapper .channel")
+	if exists {
+		// 已经登录，保存 cookies 并返回
+		if err := saveCookies(page); err != nil {
+			logrus.Errorf("failed to save cookies: %v", err)
+		}
+		_ = page.Close()
+		b.Close()
+		return &LoginStatusResponse{IsLoggedIn: true, Username: configs.Username}, nil
+	}
+
+	// 保存会话
+	s.loginSession = &BrowserLoginSession{
+		Browser:   b,
+		Page:      page,
+		CreatedAt: time.Now(),
+	}
+
+	// 启动后台 goroutine 等待登录完成
+	go s.waitForLoginCompletion()
+
+	return &LoginStatusResponse{IsLoggedIn: false}, nil
+}
+
+// waitForLoginCompletion 等待登录完成
+func (s *XiaohongshuService) waitForLoginCompletion() {
+	// 等待最多 10 分钟
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	s.loginSessionMu.Lock()
+	session := s.loginSession
+	s.loginSessionMu.Unlock()
+
+	if session == nil || session.Page == nil {
+		return
+	}
+
+	logrus.Info("Waiting for login completion...")
+
+	// 等待登录成功
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			logrus.Info("Browser login session timeout")
+			return
+		case <-ticker.C:
+			s.loginSessionMu.Lock()
+			session := s.loginSession
+			s.loginSessionMu.Unlock()
+
+			if session == nil || session.Page == nil {
+				return
+			}
+
+			// 使用非 Must 方法，避免 panic
+			exists, _, err := session.Page.Has(".main-container .user .link-wrapper .channel")
+			if err != nil {
+				logrus.Debugf("check login element error: %v", err)
+				continue
+			}
+
+			if exists {
+				// 登录成功
+				s.loginSessionMu.Lock()
+				if s.loginSession != nil {
+					s.loginSession.IsLoggedIn = true
+					s.loginSession.Username = configs.Username
+				}
+				s.loginSessionMu.Unlock()
+
+				// 保存 cookies
+				if err := saveCookies(session.Page); err != nil {
+					logrus.Errorf("failed to save cookies: %v", err)
+				} else {
+					logrus.Info("Cookies saved successfully")
+				}
+				logrus.Info("Browser login completed successfully")
+				return
+			}
+		}
+	}
+}
+
+// GetLoginSessionStatus 获取当前浏览器登录会话状态（轻量级，不创建新浏览器）
+func (s *XiaohongshuService) GetLoginSessionStatus(ctx context.Context) (*LoginStatusResponse, error) {
+	s.loginSessionMu.Lock()
+	defer s.loginSessionMu.Unlock()
+
+	// 如果没有活跃的会话，返回未登录状态
+	if s.loginSession == nil || s.loginSession.Browser == nil {
+		return &LoginStatusResponse{IsLoggedIn: false}, nil
+	}
+
+	// 检查会话是否过期（超过10分钟）
+	if time.Since(s.loginSession.CreatedAt) > 10*time.Minute {
+		return &LoginStatusResponse{IsLoggedIn: false}, nil
+	}
+
+	return &LoginStatusResponse{
+		IsLoggedIn: s.loginSession.IsLoggedIn,
+		Username:   s.loginSession.Username,
+	}, nil
+}
+
+// CloseLoginSession 关闭登录会话
+func (s *XiaohongshuService) CloseLoginSession() {
+	s.loginSessionMu.Lock()
+	defer s.loginSessionMu.Unlock()
+
+	if s.loginSession != nil {
+		if s.loginSession.Page != nil {
+			_ = s.loginSession.Page.Close()
+		}
+		if s.loginSession.Browser != nil {
+			s.loginSession.Browser.Close()
+		}
+		s.loginSession = nil
+	}
+}
+

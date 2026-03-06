@@ -64,6 +64,36 @@ func (s *AppServer) getLoginQrcodeHandler(c *gin.Context) {
 	respondSuccess(c, result, "获取登录二维码成功")
 }
 
+// checkLoginSessionHandler 检查浏览器登录会话状态（轻量级，不创建新浏览器）
+func (s *AppServer) checkLoginSessionHandler(c *gin.Context) {
+	status, err := s.xiaohongshuService.GetLoginSessionStatus(c.Request.Context())
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "SESSION_CHECK_FAILED",
+			"检查登录会话状态失败", err.Error())
+		return
+	}
+
+	c.Set("account", "ai-report")
+	respondSuccess(c, status, "检查登录会话状态成功")
+}
+
+// triggerBrowserLoginHandler 启动浏览器登录
+func (s *AppServer) triggerBrowserLoginHandler(c *gin.Context) {
+	status, err := s.xiaohongshuService.TriggerBrowserLogin(c.Request.Context())
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "BROWSER_LOGIN_FAILED",
+			"启动浏览器登录失败", err.Error())
+		return
+	}
+
+	message := "浏览器已启动，请在打开的浏览器窗口中扫码登录"
+	if status.IsLoggedIn {
+		message = "已登录"
+	}
+
+	respondSuccess(c, status, message)
+}
+
 // deleteCookiesHandler 删除 cookies，重置登录状态
 func (s *AppServer) deleteCookiesHandler(c *gin.Context) {
 	err := s.xiaohongshuService.DeleteCookies(c.Request.Context())
